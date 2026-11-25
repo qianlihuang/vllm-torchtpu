@@ -22,7 +22,8 @@ kernel. The kernels themselves are tested in their own files under
 * writing new tokens into the KV cache (`update_cache`), which is ordinary
   array reshaping and scattering with no kernel involved;
 * the SMEM-overflow guard around paged attention, which decides whether to
-  call the kernel once or split the batch into smaller pieces; and
+  call the kernel once or split the batch into smaller pieces;
+* the trimming of padding request rows before RPA (`_live_rows`); and
 * the up-front argument checks that raise a clear error before any kernel
   is ever called.
 
@@ -431,3 +432,56 @@ def test_split_q_plumbing(dcp: bool, split_q: bool, num_heads: int, expect_split
         assert mock_warn.call_args.args[3] == (num_heads, ROPE_DIM)
     else:
         mock_warn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "num_tokens, num_page_indices, num_cu_q_lens, distribution, rows, "
+    "want_distribution",
+    [
+        # A token bucket as large as the request rows keeps every row.
+        (8, 16, 5, (1, 1, 2), 4, (1, 1, 2)),
+        # Rows past the token count are padding.
+        (2, 16, 5, (1, 1, 2), 2, (1, 1, 2)),
+        # A dummy run that names more requests than it has tokens.
+        (2, 16, 5, (0, 0, 4), 2, (0, 0, 2)),
+        # Mis-shaped page_indices or cu_q_lens stay whole, so the kernel's
+        # input validation still rejects them.
+        (2, 15, 5, (0, 0, 2), 4, (0, 0, 2)),
+        (2, 16, 4, (0, 0, 2), 4, (0, 0, 2)),
+    ],
+)
+def test_live_rows(
+    num_tokens: int,
+    num_page_indices: int,
+    num_cu_q_lens: int,
+    distribution: tuple[int, int, int],
+    rows: int,
+    want_distribution: tuple[int, int, int],
+):
+    """`_live_rows` keeps only the request rows a step's tokens can hold, and
+    never lets `distribution` name a row it dropped."""
+    max_num_seqs = 4
+    kv_lens = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    page_indices = jnp.arange(num_page_indices, dtype=jnp.int32)
+    cu_q_lens = jnp.arange(num_cu_q_lens, dtype=jnp.int32)
+
+    got = attention_interface._live_rows(
+        num_tokens,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        jnp.asarray(distribution, jnp.int32),
+    )
+
+    if rows == max_num_seqs:
+        want = (kv_lens, page_indices, cu_q_lens)
+    else:
+        pages_per_seq = num_page_indices // max_num_seqs
+        want = (
+            kv_lens[:rows],
+            page_indices[: rows * pages_per_seq],
+            cu_q_lens[: rows + 1],
+        )
+    for got_array, want_array in zip(got[:3], want):
+        np.testing.assert_array_equal(got_array, want_array)
+    np.testing.assert_array_equal(got[3], want_distribution)

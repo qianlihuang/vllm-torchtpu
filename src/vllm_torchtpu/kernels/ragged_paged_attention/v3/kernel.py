@@ -248,9 +248,11 @@ def get_vmem_estimate_bytes(
     bkv_sz,
     q_dtype,
     kv_dtype,
+    out_dtype,
 ):
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
+    out_bits = jnp.dtype(out_dtype).itemsize * 8
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
     bkv_stride = cdiv(actual_num_kv_heads * 2, kv_packing)
     if has_bank_conflicts(bkv_stride):
@@ -267,10 +269,10 @@ def get_vmem_estimate_bytes(
         * (32 // q_packing)
         +
         # l_ref + m_ref
-        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32
+        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * out_bits
         +
         # acc_ref
-        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
+        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * out_bits
     )
     return cdiv(total_bits, 8)
 
@@ -1583,10 +1585,14 @@ def get_default_block_sizes(
                 bkv_csz = min(512, align_to(max_kv // 2, page_size))
         case 7:
             if case == RpaCase.DECODE:
+                # A decode block is padded work for every shorter sequence;
+                # a quarter of the peak-rate block still streams long contexts
+                # at full rate.
+                bkv_decode = max(page_size, min_bkv_sz_to_peak // 4)
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_sz = min(bkv_decode, max_kv)
                 bq_csz = 1
-                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_csz = min(bkv_decode, max_kv)
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_sz = min(2048, max_kv)
@@ -1700,7 +1706,9 @@ def ragged_paged_attention(
       d_block_sizes: the block sizes for the decode case.
       p_block_sizes: the block sizes for the prefill case.
       m_block_sizes: the block sizes for the mixed case.
-      vmem_limit_bytes: the vmem limit for the pallas kernel.
+      vmem_limit_bytes: the vmem limit for the pallas kernel. If None, v7 uses
+        twice the launch's scratch (at least 16 MiB) and other generations use
+        the full VMEM capacity.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
       disable_bounds_checks: if true, disable bounds checks.
@@ -1719,10 +1727,7 @@ def ragged_paged_attention(
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
         mask_value = cast(float, jnp.finfo(out_dtype).min)
 
-    if vmem_limit_bytes is None:
-        # TODO(jevinjiang, jacobplatin): change this to use
-        # `get_vmem_estimate_bytes` when VREG spilling is fixed.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
 
     static_validate_inputs(
         q,
@@ -1828,6 +1833,30 @@ def ragged_paged_attention(
             out_dtype,
         )
 
+        if vmem_limit_bytes is not None:
+            launch_vmem_limit = vmem_limit_bytes
+        elif tpu_version == 7:
+            # Claiming all of VMEM evicts what XLA keeps there across the call,
+            # such as the next o_proj weight. Twice the scratch leaves Mosaic
+            # room for one compute step's values and spills, and the floor for
+            # the prefill and mixed logits tiles; both were measured on v7x,
+            # so other generations keep all of VMEM.
+            scratch_bytes = get_vmem_estimate_bytes(
+                actual_num_kv_heads,
+                actual_num_q_heads_per_kv_head,
+                actual_head_dim,
+                bq_sz,
+                bkv_sz,
+                q.dtype,
+                kv_cache.dtype,
+                out_dtype,
+            )
+            launch_vmem_limit = min(
+                vmem_capacity_bytes, max(16 * 1024 * 1024, 2 * scratch_bytes)
+            )
+        else:
+            launch_vmem_limit = vmem_capacity_bytes
+
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
             bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
@@ -1888,7 +1917,7 @@ def ragged_paged_attention(
                 # TODO(jevinjiang): since each sequence depends on the previous
                 # one, we need some extra work to support Megacore mode.
                 dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
+                vmem_limit_bytes=launch_vmem_limit,
                 # Paged attention invokes multiple small DMAs for each pages
                 # instead of a single large DMA. Therefore, the overhead of bounds
                 # checking becomes too significant so we disable it.

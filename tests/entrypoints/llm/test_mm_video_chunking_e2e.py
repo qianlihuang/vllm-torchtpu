@@ -40,6 +40,7 @@ Run with:
 
 from __future__ import annotations
 
+import difflib
 import multiprocessing
 import os
 import queue as queue_lib
@@ -176,6 +177,11 @@ _BUDGETS = {
 # preserves the Pallas RPA page size and tuned block sizes.
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 2048
+# The page size max_model_len=8192 selects (PallasAttentionBackend.get_page_size).
+# Every boot pins its KV cache to max_num_seqs full-length requests of these
+# pages: the decoder programs embed the KV cache size, so boots whose profile
+# runs left different free HBM would otherwise compile different programs.
+KV_PAGE_SIZE = 256
 
 
 def _batched_chunk_budget(results: list[GenerationResult]) -> int:
@@ -275,6 +281,7 @@ def _build_llm(
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         tensor_parallel_size=_get_tensor_parallel_size(),
         gpu_memory_utilization=0.5,
+        num_gpu_blocks_override=max_num_seqs * MAX_MODEL_LEN // KV_PAGE_SIZE,
         max_num_seqs=max_num_seqs,
         compilation_config=compilation_config,
         limit_mm_per_prompt={"image": 0, "video": 1},
@@ -537,19 +544,23 @@ def _assert_bit_exact(
 
     # In bfloat16, Pallas flash-attention sets block_k equal to the total sequence
     # length, which leads to minor floating-point accumulation differences across
-    # different chunk sizes (~3-5% embedding drift after 32 ViT layers). When
+    # different chunk sizes (~3-5% embedding drift after 32 ViT layers), and the
+    # eager and compiled encoders round differently too. When
     # greedy decoding encounters a near-tie between synonyms (e.g. " reading" vs
     # " holding"), argmax can flip at that token while the surrounding generation
     # remains semantically equivalent. Allow minor divergence if the prefix
     # before divergence is substantial (>= 6 tokens) and token agreement over the
-    # common length is high (>= 80%).
+    # common length is high (>= 80%). Agreement is aligned, not position by
+    # position: a flip that changes the token count (" reading it" vs " turning
+    # the pages") shifts every later token, and positional agreement then drops
+    # to ~0.5 over the same remaining text.
     min_len = min(len(reference.token_ids), len(chunked.token_ids))
-    matching_tokens = sum(
-        1
-        for r, c in zip(reference.token_ids[:min_len], chunked.token_ids[:min_len])
-        if r == c
-    )
-    token_sim = matching_tokens / max(1, min_len)
+    token_sim = difflib.SequenceMatcher(
+        None,
+        reference.token_ids[:min_len],
+        chunked.token_ids[:min_len],
+        autojunk=False,
+    ).ratio()
     if first_diff >= 6 and token_sim >= 0.8:
         return
 

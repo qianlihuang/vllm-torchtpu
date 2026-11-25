@@ -377,6 +377,39 @@ def uses_seq_along_lane_kv_page(
     return head_size != 64 and kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
 
 
+def _live_rows(
+    num_tokens: int,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """The request rows a step of `num_tokens` tokens can hold.
+
+    Requests with tokens come first and each holds at least one, so rows past
+    `num_tokens` are padding. Dropping them keeps RPA from scalar-prefetching
+    the whole max_num_seqs page table into SMEM on every call. `distribution`
+    is clamped to the kept rows, since a dummy run may name more requests than
+    it has tokens. Mis-shaped inputs come back whole, for the kernel's input
+    validation to reject.
+    """
+    max_num_seqs = kv_lens.shape[0]
+    num_rows = min(num_tokens, max_num_seqs)
+    if (
+        num_rows == max_num_seqs
+        or page_indices.shape[0] % max_num_seqs != 0
+        or cu_q_lens.shape != (max_num_seqs + 1,)
+    ):
+        return kv_lens, page_indices, cu_q_lens, distribution
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    return (
+        kv_lens[:num_rows],
+        page_indices[: num_rows * pages_per_seq],
+        cu_q_lens[: num_rows + 1],
+        jnp.minimum(distribution, num_rows),
+    )
+
+
 def sharded_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -425,6 +458,12 @@ def sharded_ragged_paged_attention(
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
+    # Only the kernels that scalar-prefetch the page table gain: the batched
+    # kernel loads it in windows from HBM, and fewer rows can mean more windows.
+    if use_hd64 or rpa_func is ragged_paged_attention:
+        kv_lens, page_indices, cu_q_lens, distribution = _live_rows(
+            q.shape[0], kv_lens, page_indices, cu_q_lens, distribution
+        )
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     if use_hd64:
@@ -608,16 +647,24 @@ def attention_bundled(
         data_spec,  # query_start_loc
         data_spec,  # request_distribution
     )
+    # Inside the bundled RPA call the metadata are the step's JAX arrays.
+    seq_lens, block_tables, query_start_loc, request_distribution = _live_rows(
+        q.shape[0],
+        cast(jax.Array, md.seq_lens),
+        cast(jax.Array, md.block_tables),
+        cast(jax.Array, md.query_start_loc),
+        cast(jax.Array, md.request_distribution),
+    )
     args = (
         q,
         k,
         v,
         kv_cache_bundle,
         layer_idx,
-        md.seq_lens,
-        md.block_tables,
-        md.query_start_loc,
-        md.request_distribution,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
     )
 
     # Output partition specs mirror (new_bundle, output).
