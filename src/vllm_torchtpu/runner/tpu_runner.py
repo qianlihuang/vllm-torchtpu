@@ -3745,6 +3745,11 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
         else:
+            if zero_pad_tail:
+                # Avoid stale position IDs in padded rows when tail zeroing is active.
+                self.positions_cpu[
+                    total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
@@ -6925,6 +6930,10 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens, zeros=not profiling, random=profiling
             )
             self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        # Populate DPMetadata on warmup/profile dummy runs too (dp_lockstep=False)
+        # so set_forward_context skips coordinate_batch_across_dp(0) and matches
+        # serving's active DP forward context.
+        num_tokens_across_dp = self._dp_num_tokens_across_dp(num_tokens)
         with (
             self.maybe_select_dummy_loras(
                 self.lora_config, np.array([num_tokens], dtype=np.int32)
@@ -6932,10 +6941,8 @@ class TPUModelRunner(GPUModelRunner):
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=num_tokens if dp_lockstep else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
-                if dp_lockstep
-                else None,
+                num_tokens=num_tokens if num_tokens_across_dp is not None else 0,
+                num_tokens_across_dp=num_tokens_across_dp,
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,
@@ -6980,11 +6987,23 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
-                _idx = torch.zeros(
-                    self._dp_vocab_logits_rows() if self._dp_vocab_logits else num_reqs,
-                    dtype=torch.int32,
-                    device=out.device,
+                # Clamp and pad to a precompiled request bucket so idle logits
+                # shapes stay in-grid when num_tokens < num_reqs or num_reqs is
+                # not itself a request bucket.
+                logits_num_reqs = (
+                    self._dp_vocab_logits_rows()
+                    if self._dp_vocab_logits
+                    else _get_padded_num_reqs_with_upper_limit(
+                        min(num_tokens, num_reqs), self.max_num_reqs
+                    )
                 )
+                # Build on CPU and transfer via .to(out.device), matching
+                # _precompile_compute_selected_logits, so the first idle step
+                # does not compile an eager device-side zeros XLA graph.
+                _idx = torch.zeros(
+                    logits_num_reqs,
+                    dtype=torch.int32,
+                ).to(out.device)
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
