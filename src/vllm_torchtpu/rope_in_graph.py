@@ -290,6 +290,27 @@ def _yarn_spec(rope: Any, *, match_query_dtype: bool = True) -> RopeInGraphSpec:
     )
 
 
+def _deepseek_v4_spec(rope: Any) -> RopeInGraphSpec:
+    # DeepseekV4ScalingRotaryEmbedding always stores its cos_sin_cache in fp32
+    # regardless of `rope.dtype`.
+    num_rows = _scaled_num_rows(rope.max_position_embeddings, rope.scaling_factor)
+    return RopeInGraphSpec(
+        segments=(
+            CosSinSegment(
+                0,
+                num_rows,
+                to_f32_tuple(rope._compute_inv_freq(rope.scaling_factor)),
+                float(rope.mscale),
+            ),
+        ),
+        num_rows=num_rows,
+        rotary_dim=int(rope.rotary_dim),
+        cache_dtype=torch.float32,
+        match_query_dtype=False,
+        is_neox_style=bool(rope.is_neox_style),
+    )
+
+
 def longrope_segments(rope: Any) -> tuple[CosSinSegment, CosSinSegment]:
     """Returns the `(short, long)` `CosSinSegment` pair for a LongRoPE module."""
     short_len = int(rope.original_max_position_embeddings)
@@ -411,7 +432,10 @@ def _build_registry(mrope_cls: type) -> Mapping[type, RopeClassEntry]:
             upstream.FourierRotaryEmbedding: RopeClassEntry(),
             upstream.Llama4VisionRotaryEmbedding: RopeClassEntry(),
             upstream.DualChunkRotaryEmbedding: RopeClassEntry(),
-            upstream.DeepseekV4ScalingRotaryEmbedding: RopeClassEntry(),
+            upstream.DeepseekV4ScalingRotaryEmbedding: RopeClassEntry(
+                build_spec=_deepseek_v4_spec,
+                tier1=None,
+            ),
         }
     )
     return types.MappingProxyType(entries)
@@ -822,15 +846,70 @@ def _restore_upstream_table(rope: Any) -> None:
     rope.register_buffer("cos_sin_cache", cache, persistent=False)
 
 
-def require_cos_sin_table(module: nn.Module) -> None:
-    """Exempts `module` from the post-load sweep so `cos_sin_cache` stays a tensor.
+def get_rope_rotary_dim(rotary_emb: nn.Module) -> int:
+    """Returns the `[cos | sin]` width (`rotary_dim`) of `rotary_emb`."""
+    spec = getattr(rotary_emb, "_in_graph_spec", None)
+    if isinstance(spec, RopeInGraphSpec):
+        return spec.rotary_dim
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    if cache is not None:
+        return int(cache.shape[-1])
+    cos = getattr(rotary_emb, "cos", None)
+    if cos is not None:
+        return int(cos.shape[-1]) * 2
+    return int(cast(Any, rotary_emb).rotary_dim)
 
-    For callers that pass the table to a kernel. `module` must not be a Tier-1
-    class: those are already converted at `__init__`.
+
+def get_rope_cos_sin(
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Returns per-position `[cos | sin]` rows of shape
+    `(*positions.shape, rotary_dim)`.
+
+    Computes `cos` and `sin` in-graph when `rotary_emb` has been converted via
+    `RopeInGraphSpec` or `InGraphCosSinCache`, and falls back to indexing
+    `rotary_emb.cos_sin_cache` when `tpu_rope_in_graph` is disabled.
     """
-    # TODO(#2747): remove once the DeepSeek-V4 Pallas kernels take per-token
-    # cos/sin.
-    cast(Any, module)._tpu_rope_table_required = True
+    spec = getattr(rotary_emb, "_in_graph_spec", None)
+    if isinstance(spec, RopeInGraphSpec):
+        out_dtype = spec.cache_dtype if dtype is None else dtype
+        if (
+            positions.ndim >= 2
+            and spec.dim_modalities is not None
+            and positions.shape[0] == 3
+        ):
+            pos_for_freq = _select_mrope_positions(
+                positions.reshape(3, -1), spec.dim_modalities
+            )
+            out_shape = (*positions.shape[1:], spec.rotary_dim)
+        else:
+            pos_for_freq = positions.reshape(-1)
+            out_shape = (*positions.shape, spec.rotary_dim)
+        rows = eval_spec_cos_sin(spec, pos_for_freq, out_dtype)
+        return rows.reshape(out_shape)
+
+    cache: Any = getattr(rotary_emb, "cos_sin_cache", None)
+    if isinstance(cache, InGraphCosSinCache):
+        rows = cache[positions]
+        return rows if dtype is None or rows.dtype == dtype else rows.to(dtype)
+    if isinstance(cache, torch.Tensor):
+        rows = cache.index_select(0, positions.reshape(-1).clamp(min=0)).reshape(
+            *positions.shape, cache.shape[-1]
+        )
+        return rows if dtype is None or rows.dtype == dtype else rows.to(dtype)
+
+    cos = getattr(rotary_emb, "cos", None)
+    sin = getattr(rotary_emb, "sin", None)
+    if cos is not None and sin is not None:
+        rows = torch.cat((cos[positions], sin[positions]), dim=-1)
+        return rows if dtype is None or rows.dtype == dtype else rows.to(dtype)
+
+    raise AttributeError(
+        f"{type(rotary_emb).__name__} has neither in-graph RoPE spec nor cos_sin_cache"
+    )
 
 
 class Tier1InGraphRopeMixin:

@@ -73,7 +73,6 @@ def test_indexer_refuses_a_cache_of_the_other_layout():
     with pytest.raises(ValueError, match="SEQ_ALONG_LANE layout"):
         _indexer_jax(
             jnp.zeros((1, 1, 128), jnp.bfloat16),
-            zeros,
             jnp.zeros((1, 64), jnp.float32),
             jnp.zeros((1, 1), jnp.float32),
             jnp.zeros((1, 64, 4, 256), jnp.uint8),
@@ -180,8 +179,7 @@ def _group_ids(fn):
     t, h, pages = 128, 4, 8
     args = (
         jax.ShapeDtypeStruct((t, h, 128), jnp.bfloat16),  # q
-        jax.ShapeDtypeStruct((t,), jnp.int32),  # positions
-        jax.ShapeDtypeStruct((4096, 64), jnp.float32),  # cos_sin_cache
+        jax.ShapeDtypeStruct((t, 64), jnp.float32),  # cos_sin
         jax.ShapeDtypeStruct((t, h), jnp.float32),  # indexer_weights
         jax.ShapeDtypeStruct(  # SEQ_ALONG_LANE cache
             (pages, compressor_config.SAL_SUBLANE_GROUPS, 4, 256), jnp.uint8

@@ -861,6 +861,8 @@ def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
 
     assert vision_rope.cos_sin_cache.dtype == torch.complex64
 
+    ref_dsv4_table = dsv4_rope.cos_sin_cache.clone()
+
     draft_wrapper = nn.Module()
     draft_wrapper.dsv4 = dsv4_rope
     draft_wrapper.fope = fope
@@ -872,12 +874,21 @@ def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
         rope_patch.patch_in_graph_rotary_embedding(
             draft_wrapper, allow_table_recovery=True
         )
-        == 1
+        == 2
     )
     assert "_rope_cos_sin_cache" not in draft_wrapper.__dict__
-    assert isinstance(dsv4_rope.cos_sin_cache, torch.Tensor)
+    assert isinstance(dsv4_rope.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
     assert isinstance(fope.cos_sin_cache, torch.Tensor)
     assert isinstance(vision_rope.cos_sin_cache, torch.Tensor)
+
+    idx = torch.tensor([0, 3, 17, 255], dtype=torch.int32)
+    assert rope_in_graph.get_rope_rotary_dim(dsv4_rope) == _HEAD_SIZE
+    torch.testing.assert_close(
+        rope_in_graph.get_rope_cos_sin(dsv4_rope, idx, dtype=torch.float32),
+        ref_dsv4_table.index_select(0, idx),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -1144,16 +1155,51 @@ def test_rotary_base_never_uses_content_recovery_and_warns(
     assert any("_UnknownFutureRotaryEmbedding" in w for w in warnings_seen)
 
 
-def test_require_cos_sin_table_exempts_module_from_sweep() -> None:
-    """A module marked with `require_cos_sin_table` keeps its table in a sweep."""
-    synth = _SyntheticRotaryEmbedding(dtype=torch.float32)
-    table = synth.cos_sin_cache
-    rope_in_graph.require_cos_sin_table(synth)
+def test_get_rope_cos_sin_and_rotary_dim_across_patched_and_unpatched() -> None:
+    raw_rope = _SyntheticRotaryEmbedding(dtype=torch.bfloat16)
+    patched_rope = copy.deepcopy(raw_rope)
     assert (
-        rope_patch.patch_in_graph_rotary_embedding(synth, allow_table_recovery=True)
-        == 0
+        rope_patch.patch_in_graph_rotary_embedding(
+            patched_rope, allow_table_recovery=True
+        )
+        == 1
     )
-    assert synth.cos_sin_cache is table
+
+    positions = torch.tensor([0, 4, 19, 127], dtype=torch.int32)
+    assert rope_in_graph.get_rope_rotary_dim(raw_rope) == _HEAD_SIZE
+    assert rope_in_graph.get_rope_rotary_dim(patched_rope) == _HEAD_SIZE
+
+    raw_f32 = rope_in_graph.get_rope_cos_sin(raw_rope, positions, dtype=torch.float32)
+    patched_f32 = rope_in_graph.get_rope_cos_sin(
+        patched_rope, positions, dtype=torch.float32
+    )
+    assert raw_f32.shape == (4, _HEAD_SIZE)
+    assert raw_f32.dtype == torch.float32
+    assert patched_f32.dtype == torch.float32
+    torch.testing.assert_close(patched_f32, raw_f32, rtol=0, atol=1.6e-2)
+
+    # 2-D positions shape preservation and paired cos/sin support.
+    pos_2d = positions.view(2, 2)
+    assert rope_in_graph.get_rope_cos_sin(patched_rope, pos_2d).shape == (
+        2,
+        2,
+        _HEAD_SIZE,
+    )
+
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 16, 2).float() / 16.0))
+    angles = torch.outer(torch.arange(64, dtype=torch.float32), inv_freq)
+    pair_mod = nn.Module()
+    pair_mod.register_buffer("cos", angles.cos(), persistent=False)
+    pair_mod.register_buffer("sin", angles.sin(), persistent=False)
+    assert rope_patch.patch_cos_sin_table_pairs(pair_mod) == 1
+    assert rope_in_graph.get_rope_rotary_dim(pair_mod) == 16
+    pair_pos = torch.tensor([0, 7, 63], dtype=torch.int32)
+    torch.testing.assert_close(
+        rope_in_graph.get_rope_cos_sin(pair_mod, pair_pos, dtype=torch.float32),
+        torch.cat((angles.cos()[pair_pos], angles.sin()[pair_pos]), dim=-1),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 @pytest.mark.parametrize(
