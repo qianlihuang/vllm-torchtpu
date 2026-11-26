@@ -23,9 +23,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 # Compute rotary cos/sin in-graph from positions instead of indexing a
-# precomputed [max_position, rotary_dim] HBM table. Off by default.
-# TODO(#2747): flip the default to true once serving and nightly coverage are
-# validated; remove this key together with TPU_ROPE_CACHE_TRUNCATE and
+# precomputed [max_position, rotary_dim] HBM table. On by default; set to
+# false in `--additional-config` to keep the precomputed table.
+# TODO(#2747): remove this key together with TPU_ROPE_CACHE_TRUNCATE and
 # TPU_ROPE_CACHE_ROW_MAJOR once the DeepSeek-V4 Pallas kernels no longer read
 # the table.
 KEY = "tpu_rope_in_graph"
@@ -36,7 +36,7 @@ def in_graph_enabled(vllm_config: "VllmConfig | None") -> bool:
     if vllm_config is None:
         return False
     additional_config = cast("dict[str, Any]", vllm_config.additional_config)
-    value = additional_config.get(KEY, False)
+    value = additional_config.get(KEY, True)
     if not isinstance(value, bool):
         raise ValueError(f"additional_config[{KEY!r}] must be a bool, got {value!r}")
     return value
