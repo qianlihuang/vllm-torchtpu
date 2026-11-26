@@ -15,22 +15,29 @@
 
 from __future__ import annotations
 
-from .gdn import GDN, GDNLinInLayout, GDNModule, GDNParams
+from .gdn import (
+    GDN,
+    GDNLinInLayout,
+    GDNModule,
+    GDNParams,
+)
 from .gqa import GQA, GQAModule, GQAParams
-from .moe import MoEDebug, MoEParams
+from .moe import MoE, MoEDebug, MoEModule, MoEParams
 from .norm import Embedding, EmbeddingModule, Norm, NormModule
 
 __all__ = [
-    "GDN",
-    "GQA",
     "Embedding",
     "EmbeddingModule",
+    "GDN",
     "GDNLinInLayout",
     "GDNModule",
     "GDNParams",
+    "GQA",
     "GQAModule",
     "GQAParams",
+    "MoE",
     "MoEDebug",
+    "MoEModule",
     "MoEParams",
     "Norm",
     "NormModule",
