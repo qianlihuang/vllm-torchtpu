@@ -1843,7 +1843,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in canary_torchtpu.uploads],
-            ["verify", "integration", *_TESTS, "cpu", "build"],
+            ["verify", *_INTEGRATION, *_TESTS, "cpu", "build"],
         )
 
         torchtpu_nightly = self._run_bootstrap(
@@ -1906,7 +1906,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 self.assertIn(("TORCHTPU_NIGHTLY_LEG", expected_leg), rec_leg.meta)
                 self.assertEqual(
                     [u[0] for u in rec_leg.uploads],
-                    ["verify", "integration", *_TESTS, "cpu", "build"],
+                    ["verify", *_INTEGRATION, *_TESTS, "cpu", "build"],
                 )
 
         # vLLM HEAD canary (canonical slug, legacy slug, and CI_SUITE=vllm-canary
